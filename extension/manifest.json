@@ -1,0 +1,26 @@
+﻿{
+  "manifest_version": 3,
+  "name": "Discord Orb Collector",
+  "version": "1.1.0",
+  "description": "Automatically watches and claims Discord video quest rewards (Orbs).",
+  "permissions": ["scripting", "storage", "tabs"],
+  "host_permissions": [
+    "https://discord.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://discord.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Discord Orb Collector",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
