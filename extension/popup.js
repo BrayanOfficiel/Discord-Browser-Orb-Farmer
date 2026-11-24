@@ -1,24 +1,32 @@
-﻿'use strict';
+'use strict';
+
+// Chrome exposes `chrome.*`, Safari exposes both `browser.*` and `chrome.*`.
+const api = globalThis.browser ?? globalThis.chrome;
+
+const QUEST_HOME_URL = 'https://discord.com/quest-home';
+const DISCORD_RE = /^https:\/\/discord\.com\//;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const $ = id => document.getElementById(id);
 
 function timestamp() {
-  const d = new Date();
-  return d.getHours().toString().padStart(2,'0') + ':' +
-         d.getMinutes().toString().padStart(2,'0') + ':' +
-         d.getSeconds().toString().padStart(2,'0');
+  return new Date().toTimeString().slice(0, 8);
 }
 
+/** Adds a log line. Uses textContent only: messages contain Discord page text. */
 function addLog(msg, type = 'info') {
   const ul = $('log-list');
   const li = document.createElement('li');
   li.className = type;
-  li.innerHTML = '<span class="ts">' + timestamp() + '</span>' +
-                 '<span class="msg">' + msg + '</span>';
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = timestamp();
+  const m = document.createElement('span');
+  m.className = 'msg';
+  m.textContent = String(msg);
+  li.append(ts, m);
   ul.appendChild(li);
-  // keep only last 40 entries
   while (ul.children.length > 40) ul.removeChild(ul.firstChild);
   ul.scrollTop = ul.scrollHeight;
 }
@@ -26,125 +34,109 @@ function addLog(msg, type = 'info') {
 // ── State reflected in the popup ─────────────────────────────────────────────
 
 const ui = {
-  phase:       'idle',
-  questsDone:  0,
-  questQueue:  0,
-  orbBalance:  null,
-  currentQuest: null,
-  videoProgress: 0,   // 0-100
+  phase:         'idle',
+  questsDone:    0,
+  questQueue:    0,
+  orbBalance:    null,
+  currentQuest:  null,
+  videoProgress: 0,
 };
 
-// Phase → dot class + status text
 const PHASE_META = {
-  boot:       { dot: 'idle',    text: 'Starting up…' },
+  boot:       { dot: 'idle',    text: 'Ready' },
   idle:       { dot: 'idle',    text: 'Idle — ready to run' },
   navigating: { dot: 'running', text: 'Navigating to quest-home…' },
   scanning:   { dot: 'running', text: 'Scanning for quests…' },
   watching:   { dot: 'running', text: 'Watching video…' },
-  captcha:    { dot: 'captcha', text: 'Waiting for captcha…' },
+  captcha:    { dot: 'captcha', text: 'Solve the captcha in the Discord tab' },
   claiming:   { dot: 'running', text: 'Claiming reward…' },
   dismissing: { dot: 'running', text: 'Dismissing modal…' },
-  done:       { dot: 'done',    text: 'All quests complete! 🎉' },
+  done:       { dot: 'done',    text: 'All quests processed 🎉' },
   stopped:    { dot: 'idle',    text: 'Stopped by user' },
-  error:      { dot: 'error',   text: 'Error — check console' },
+  error:      { dot: 'error',   text: 'Error — check the log' },
   no_tab:     { dot: 'error',   text: 'No Discord tab found' },
+  no_script:  { dot: 'error',   text: 'Extension not active on this tab' },
 };
 
+const RUNNING = ['navigating', 'scanning', 'watching', 'captcha', 'claiming', 'dismissing'];
+
 function applyState(s) {
-  // merge incoming state into ui
-  if (s.phase       !== undefined) ui.phase       = s.phase;
-  if (s.questsDone  !== undefined) ui.questsDone  = s.questsDone;
-  if (s.questQueue  !== undefined) ui.questQueue  = s.questQueue;
-  if (s.orbBalance  !== undefined) ui.orbBalance  = s.orbBalance;
-  if (s.currentQuest!== undefined) ui.currentQuest= s.currentQuest;
-  if (s.videoProgress!==undefined) ui.videoProgress= s.videoProgress;
+  for (const k of Object.keys(ui)) if (s[k] !== undefined) ui[k] = s[k];
 
   const meta = PHASE_META[ui.phase] || PHASE_META.idle;
-
-  // dot
-  const dot = $('dot');
-  dot.className = 'dot ' + meta.dot;
-
-  // status text
+  $('dot').className = 'dot ' + meta.dot;
   $('status-text').textContent = meta.text;
 
-  // stats
   $('stat-done').textContent  = ui.questsDone;
   $('stat-queue').textContent = ui.questQueue;
   $('stat-orbs').textContent  = ui.orbBalance !== null ? ui.orbBalance : '—';
 
-  // progress bar
-  const fill = $('progress-fill');
-  const pct  = ui.videoProgress;
-  fill.style.width = pct + '%';
+  const pct = ui.phase === 'watching' ? ui.videoProgress : 0;
+  $('progress-fill').style.width  = pct + '%';
   $('progress-pct').textContent   = pct > 0 ? pct + '%' : '';
-  $('progress-label').textContent = ui.currentQuest
-    ? 'Watching: ' + ui.currentQuest
-    : (ui.phase === 'watching' ? 'Watching…' : 'No active quest');
+  $('progress-label').textContent = ui.phase === 'watching' ? 'Watching…' : 'No active quest';
 
-  // current quest label
   const cq = $('current-quest');
+  cq.textContent = '';
   if (ui.currentQuest) {
-    cq.innerHTML = 'Quest: <span>' + ui.currentQuest + '</span>';
-  } else {
-    cq.textContent = '';
+    const span = document.createElement('span');
+    span.textContent = ui.currentQuest;
+    cq.append('Quest: ', span);
   }
 
-  // button states
-  const running = ['navigating','scanning','watching','captcha','claiming','dismissing'].includes(ui.phase);
+  const running = RUNNING.includes(ui.phase);
   $('btn-start').disabled = running;
   $('btn-stop').disabled  = !running;
 }
 
 // ── Communication with content script ────────────────────────────────────────
 
-async function getActiveDiscordTab() {
-  const tabs = await chrome.tabs.query({ url: 'https://discord.com/*' });
-  if (!tabs.length) return null;
-  // prefer quest-home tab, else first discord tab
-  return tabs.find(t => t.url && t.url.includes('quest-home')) || tabs[0];
+/**
+ * Finds the Discord tab to drive: the active tab if it is Discord, else a
+ * quest-home tab, else any Discord tab. Filters manually instead of using the
+ * `url` query option, which Safari only honours for tabs it has permission on.
+ */
+async function getDiscordTab() {
+  const [active] = await api.tabs.query({ active: true, currentWindow: true });
+  if (active && DISCORD_RE.test(active.url || '')) return active;
+  const tabs = (await api.tabs.query({})).filter(t => DISCORD_RE.test(t.url || ''));
+  return tabs.find(t => t.url.includes('/quest-home')) || tabs[0] || null;
 }
 
-async function sendToContent(msg) {
-  const tab = await getActiveDiscordTab();
+let warnedNoScript = false;
+
+async function sendToContent(msg, { quiet = false } = {}) {
+  const tab = await getDiscordTab();
   if (!tab) {
     applyState({ phase: 'no_tab' });
-    addLog('No Discord tab found — open discord.com first', 'error');
+    if (!quiet) addLog('No Discord tab found — click Open Quests', 'error');
     return null;
   }
   try {
-    const resp = await chrome.tabs.sendMessage(tab.id, msg);
-    return resp;
-  } catch (e) {
-    addLog('Content script not responding — refresh discord.com', 'warn');
+    return await api.tabs.sendMessage(tab.id, msg);
+  } catch (_) {
+    applyState({ phase: 'no_script' });
+    if (!quiet || !warnedNoScript) {
+      warnedNoScript = true;
+      addLog('Content script not responding — reload discord.com' +
+             (isSafari() ? ' and allow the extension on discord.com in Safari' : ''), 'warn');
+    }
     return null;
   }
 }
 
+function isSafari() {
+  return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+}
+
 async function pollStatus() {
-  const resp = await sendToContent({ action: 'getStatus' });
+  const resp = await sendToContent({ action: 'getStatus' }, { quiet: true });
   if (resp) applyState(resp);
-}
-
-// ── Poll loop ────────────────────────────────────────────────────────────────
-
-let pollTimer = null;
-
-function startPolling() {
-  if (pollTimer) return;
-  pollTimer = setInterval(pollStatus, 1200);
-  pollStatus();   // immediate first tick
-}
-
-function stopPolling() {
-  clearInterval(pollTimer);
-  pollTimer = null;
 }
 
 // ── Button handlers ───────────────────────────────────────────────────────────
 
 $('btn-start').addEventListener('click', async () => {
-  addLog('Start requested', 'info');
   const resp = await sendToContent({ action: 'start' });
   if (resp) {
     applyState(resp);
@@ -153,43 +145,30 @@ $('btn-start').addEventListener('click', async () => {
 });
 
 $('btn-stop').addEventListener('click', async () => {
-  addLog('Stop requested', 'warn');
   const resp = await sendToContent({ action: 'stop' });
-  if (resp) {
-    applyState(resp);
-    addLog('Automation stopped', 'warn');
-  }
+  if (resp) applyState(resp);
 });
 
 $('btn-open').addEventListener('click', async () => {
-  const tabs = await chrome.tabs.query({ url: 'https://discord.com/*' });
-  if (tabs.length) {
-    chrome.tabs.update(tabs[0].id, { url: 'https://discord.com/quest-home', active: true });
-  } else {
-    chrome.tabs.create({ url: 'https://discord.com/quest-home' });
-  }
+  const tab = await getDiscordTab();
+  if (tab) await api.tabs.update(tab.id, { url: QUEST_HOME_URL, active: true });
+  else     await api.tabs.create({ url: QUEST_HOME_URL });
   addLog('Opened quest-home', 'info');
 });
 
 $('btn-clear-log').addEventListener('click', () => {
-  $('log-list').innerHTML = '';
+  $('log-list').textContent = '';
 });
 
-// ── Listen for push events from content script ───────────────────────────────
+// ── Push events from content script ──────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'orbCollectorEvent') {
-    applyState(msg.state || {});
-    if (msg.log) {
-      addLog(msg.log.text, msg.log.level || 'info');
-    }
-  }
+api.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'orbCollectorEvent') return;
+  applyState(msg.state || {});
+  if (msg.log) addLog(msg.log.text, msg.log.level || 'info');
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 
-addLog('Popup opened', 'info');
-startPolling();
-
-// Stop polling when popup closes to avoid ghost timers
-window.addEventListener('unload', stopPolling);
+setInterval(pollStatus, 1200);
+pollStatus();

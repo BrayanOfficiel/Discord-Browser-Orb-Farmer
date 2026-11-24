@@ -1,94 +1,153 @@
-﻿/**
+/**
  * Discord Orb Collector - content.js
  * ====================================
- * 10-step automation for video quests on discord.com/quest-home
+ * Automation for video quests on discord.com/quest-home.
+ * Works in Chrome / Chromium (MV3) and Safari (Safari Web Extension).
  *
- *  1.  Navigate to /quest-home if not already there
+ * Nothing runs until the user presses Start in the popup.
+ *
+ *  1.  Navigate to /quest-home if not already there (resumes after reload)
  *  2.  Wait for Discord React shell to fully render
  *  3.  Scroll the Available Quests grid into view
  *  4.  Discover and queue all Watch-Xs video-quest buttons
- *  5.  Click the first Watch button - video modal opens
- *  6.  Parse video duration from timestamp and wait it out
- *  7.  Detect hCaptcha - click iframe checkbox; pause for manual solve if needed
+ *  5.  Click the next Watch button - video modal opens
+ *  6.  Follow the real <video> element until it has actually finished
+ *  7.  If an hCaptcha checkpoint appears, pause until the user solves it
  *  8.  Click Claim Reward once it unlocks
- *  9.  Dismiss the reward modal
- * 10.  Loop to next quest with jitter; rescan for lazy-loaded cards
+ *  9.  Dismiss the reward modal and read the new Orb balance
+ * 10.  Loop to the next quest; rescan for lazy-loaded cards
  */
 
 'use strict';
+
+// Chrome exposes `chrome.*`, Safari exposes both `browser.*` and `chrome.*`.
+const api = globalThis.browser ?? globalThis.chrome;
 
 // ============================================================
 // Configuration - edit these values to tune the automation
 // ============================================================
 
 const CONFIG = {
-  // Fallback wait when video duration cannot be parsed from the timestamp
+  // Wait used only when neither a <video> element nor a "0:01 / 0:37"
+  // timestamp can be found in the quest modal
   VIDEO_FALLBACK_MS:       3 * 60 * 1000,
 
-  // Extra grace period after the video timer expires before hunting Claim
+  // How long to keep retrying to locate the <video> / timestamp after the modal opens
+  VIDEO_DETECT_TIMEOUT_MS: 8000,
+
+  // A video counts as finished once currentTime reaches this fraction of duration
+  VIDEO_DONE_RATIO:        0.98,
+
+  // Extra grace period after the video ends before hunting Claim
   POST_VIDEO_GRACE_MS:     3000,
 
   // Max time to poll for any expected DOM element before giving up
   ELEMENT_TIMEOUT_MS:      15000,
 
+  // Max time to wait for Claim Reward to unlock after the video
+  CLAIM_TIMEOUT_MS:        30000,
+
   // Interval between each poll tick
   POLL_INTERVAL_MS:        500,
 
-  // Max time to wait for hCaptcha to auto-clear before asking user to solve
-  CAPTCHA_AUTO_TIMEOUT_MS: 30000,
+  // Max time to wait for the user to solve a captcha
+  CAPTCHA_MANUAL_TIMEOUT_MS: 5 * 60 * 1000,
 
-  // Random delay between quests to look more human (ms)
+  // Random pause between quests (ms)
   JITTER_MIN_MS:           2000,
   JITTER_MAX_MS:           4500,
 
+  // A quest whose Watch button is still there after this many attempts is skipped
+  MAX_ATTEMPTS_PER_QUEST:  2,
+
   QUEST_HOME_URL: 'https://discord.com/quest-home',
+  PENDING_START_KEY: 'orbCollectorPendingStart',
 };
 
 // ============================================================
-// State machine
-// idle | navigating | scanning | watching | captcha | claiming | dismissing | done
+// State
+// boot | idle | navigating | scanning | watching | captcha |
+// claiming | dismissing | done | stopped | error
 // ============================================================
 
 const STATE = {
-  phase:      'boot',
-  questQueue: [],   // Watch-button DOM nodes waiting to be processed
+  phase:        'idle',
+  running:      false,
+  stopped:      false,
+  questQueue:   [],          // Watch-button DOM nodes waiting to be processed
+  attempts:     new Map(),   // quest key -> number of attempts this run
+  questsDone:   0,
+  skipped:      0,
+  orbBalance:   null,
+  currentQuest: null,
+  videoProgress: 0,          // 0-100
 };
 
+class StoppedError extends Error {
+  constructor() { super('Stopped by user'); this.name = 'StoppedError'; }
+}
+
 // ============================================================
-// Logging  (coloured output in DevTools console)
+// Logging (console + popup)
 // ============================================================
 
-const log  = (m, ...a) => console.log(  '%c[Orb Collector]%c ' + m, 'color:#7289da;font-weight:bold', 'color:inherit', ...a);
-const warn = (m, ...a) => console.warn( '%c[Orb Collector]%c ' + m, 'color:#faa61a;font-weight:bold', 'color:inherit', ...a);
-const err  = (m, ...a) => console.error('%c[Orb Collector]%c ' + m, 'color:#ed4245;font-weight:bold', 'color:inherit', ...a);
+const PREFIX = '%c[Orb Collector]%c ';
+const log  = (m, ...a) => { console.log(  PREFIX + m, 'color:#7289da;font-weight:bold', 'color:inherit', ...a); };
+const warn = (m, ...a) => { console.warn( PREFIX + m, 'color:#faa61a;font-weight:bold', 'color:inherit', ...a); };
+const err  = (m, ...a) => { console.error(PREFIX + m, 'color:#ed4245;font-weight:bold', 'color:inherit', ...a); };
+
+function snapshot() {
+  return {
+    phase:         STATE.phase,
+    questsDone:    STATE.questsDone,
+    questQueue:    STATE.questQueue.length,
+    skipped:       STATE.skipped,
+    orbBalance:    STATE.orbBalance,
+    currentQuest:  STATE.currentQuest,
+    videoProgress: STATE.videoProgress,
+  };
+}
+
+/** Pushes state (and optionally a log line) to the popup if it is open. */
+function push(text, level) {
+  const payload = { type: 'orbCollectorEvent', state: snapshot() };
+  if (text) payload.log = { text, level: level || 'info' };
+  try {
+    const p = api.runtime.sendMessage(payload);
+    // No listener (popup closed) rejects the promise - that's expected
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (_) { /* extension reloaded / context invalidated */ }
+}
+
+/** Console + popup log in one call. */
+function report(text, level = 'info') {
+  (level === 'error' ? err : level === 'warn' ? warn : log)(text);
+  push(text, level);
+}
+
+function setPhase(phase) {
+  STATE.phase = phase;
+  push(null);
+}
 
 // ============================================================
 // Utilities
 // ============================================================
 
-const sleep   = ms => new Promise(r => setTimeout(r, ms));
 const randInt = (lo, hi) => Math.floor(Math.random() * (hi - lo + 1)) + lo;
 
-/**
- * Full MouseEvent chain so React synthetic events fire reliably.
- * A bare .click() is sometimes swallowed by React's event delegation.
- */
-function nativeClick(el) {
-  ['mouseover', 'mouseenter', 'mousemove', 'mousedown', 'mouseup', 'click'].forEach(t =>
-    el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }))
-  );
+function checkStop() {
+  if (STATE.stopped) throw new StoppedError();
 }
 
-/** .click() with MouseEvent chain as fallback. */
-function reliableClick(el) {
-  try { el.click(); } catch (_) { nativeClick(el); }
-}
-
-/** True when the element is attached to layout with non-zero dimensions. */
-function isVisible(el) {
-  if (!el) return false;
-  const r = el.getBoundingClientRect();
-  return r.width > 0 && r.height > 0;
+/** Sleep that wakes up early (and throws) when the user presses Stop. */
+async function sleep(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    checkStop();
+    await new Promise(r => setTimeout(r, Math.min(250, end - Date.now())));
+  }
+  checkStop();
 }
 
 /**
@@ -98,6 +157,7 @@ function isVisible(el) {
 async function waitFor(fn, ms = CONFIG.ELEMENT_TIMEOUT_MS) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
+    checkStop();
     const v = fn();
     if (v) return v;
     await sleep(CONFIG.POLL_INTERVAL_MS);
@@ -105,26 +165,66 @@ async function waitFor(fn, ms = CONFIG.ELEMENT_TIMEOUT_MS) {
   return null;
 }
 
-/** First visible button/[role=button] whose text matches the regex. */
-function findButton(re) {
-  const nodes = document.querySelectorAll(
-    'button, [role="button"], [class*="button" i], [class*="btn" i]'
-  );
-  for (const el of nodes) {
-    if (!isVisible(el)) continue;
-    const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
-    if (re.test(t)) return el;
+/** Full MouseEvent chain so React's delegated handlers fire reliably. */
+function reliableClick(el) {
+  el.scrollIntoView({ block: 'center' });
+  for (const t of ['pointerover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+    const Ctor = t.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+    el.dispatchEvent(new Ctor(t, { bubbles: true, cancelable: true, view: window }));
   }
-  return null;
+  el.click();
 }
 
+/** True when the element is attached to layout with non-zero dimensions. */
+function isVisible(el) {
+  if (!el || !el.isConnected) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+
+function textOf(el) {
+  return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
+const CLICKABLE = 'button, [role="button"], a[href], [class*="button" i]';
+
 /**
- * TreeWalker text search - faster than querySelectorAll('*') for scanning
- * large React-rendered DOM trees.
+ * Returns visible clickable elements whose text matches `re`, normalised to the
+ * real button (Discord nests [class*=button] divs inside <button>s, which used
+ * to queue the same quest twice).
  */
-function findText(str) {
+function findButtons(re, root = document) {
+  const seen = new Set();
+  const out = [];
+  for (const el of root.querySelectorAll(CLICKABLE)) {
+    if (!isVisible(el)) continue;
+    const t = textOf(el) || el.getAttribute('aria-label') || '';
+    if (!re.test(t)) continue;
+    const btn = el.closest('button, [role="button"]') || el;
+    if (seen.has(btn)) continue;
+    seen.add(btn);
+    out.push(btn);
+  }
+  return out;
+}
+
+const findButton = (re, root) => findButtons(re, root)[0] || null;
+
+/** Walks visible text nodes only (skips <script>/<style> and hidden elements). */
+function textWalker(root = document.body) {
+  return document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(n) {
+      const p = n.parentElement;
+      if (!p || p.closest('script, style, noscript, template')) return NodeFilter.FILTER_REJECT;
+      return isVisible(p) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+}
+
+/** Returns the parent element of the first visible text node containing str. */
+function findText(str, root = document.body) {
   const lo = str.toLowerCase();
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const walker = textWalker(root);
   let n;
   while ((n = walker.nextNode())) {
     if (n.textContent.toLowerCase().includes(lo)) return n.parentElement;
@@ -132,35 +232,52 @@ function findText(str) {
   return null;
 }
 
-// ============================================================
-// Step 1 - Ensure we are on quest-home
-// ============================================================
+/** The top-most open modal, or document.body if none. */
+function topDialog() {
+  const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].filter(isVisible);
+  return dialogs[dialogs.length - 1] || null;
+}
 
-function ensureQuestHome() {
-  const path = window.location.pathname.replace(/\/$/, '');
-  if (path !== '/quest-home') {
-    log('Not on quest-home - redirecting...');
-    STATE.phase = 'navigating';
-    window.location.replace(CONFIG.QUEST_HOME_URL);
-    return false;   // page reloads; content script re-runs automatically
-  }
-  log('On quest-home');
-  return true;
+function isOnQuestHome() {
+  return window.location.pathname.replace(/\/$/, '') === '/quest-home';
 }
 
 // ============================================================
-// Step 2 - Wait for React shell (#app-mount) to render
+// Pending-start flag (survives the redirect to quest-home)
+// ============================================================
+
+async function setPendingStart(value) {
+  try {
+    if (value) await api.storage.local.set({ [CONFIG.PENDING_START_KEY]: Date.now() });
+    else       await api.storage.local.remove(CONFIG.PENDING_START_KEY);
+  } catch (e) { warn('storage unavailable: ' + e.message); }
+}
+
+async function consumePendingStart() {
+  try {
+    const got = await api.storage.local.get(CONFIG.PENDING_START_KEY);
+    const ts  = got && got[CONFIG.PENDING_START_KEY];
+    if (ts) await api.storage.local.remove(CONFIG.PENDING_START_KEY);
+    // Only honour a recent request (avoids surprise starts days later)
+    return !!ts && Date.now() - ts < 2 * 60 * 1000;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ============================================================
+// Step 1/2 - Navigate and wait for the React shell
 // ============================================================
 
 async function waitForAppMount() {
   log('Waiting for app shell...');
-  await waitFor(() => {
+  const ok = await waitFor(() => {
     const mount = document.getElementById('app-mount');
-    if (!mount) return false;
-    const child = mount.querySelector('[class]');
-    return child && child.offsetHeight > 0;   // has real layout content
+    const child = mount && mount.querySelector('[class]');
+    return child && child.offsetHeight > 0;
   }, 30000);
-  log('App shell ready');
+  if (!ok) warn('App shell not detected after 30s - continuing anyway');
+  await sleep(2000);   // extra hydration time for quest cards
 }
 
 // ============================================================
@@ -174,10 +291,14 @@ async function scrollToGrid() {
   const heading = findText('Available Quests');
   if (heading) {
     heading.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    log('Scrolled to Available Quests heading');
   } else {
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-    warn('Heading not found - scrolled to bottom as fallback');
+    // Discord's quest page scrolls inside its own container, not the window
+    const scroller = [...document.querySelectorAll('[class*="scroller" i]')]
+      .filter(el => el.scrollHeight > el.clientHeight)
+      .sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
+    if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
+    else window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    warn('"Available Quests" heading not found - scrolled to bottom as fallback');
   }
   await sleep(1000);   // wait for scroll + lazy render
 }
@@ -186,34 +307,56 @@ async function scrollToGrid() {
 // Step 4 - Collect Watch-Xs buttons into the queue
 // ============================================================
 
-// Matches: "Watch 1m", "Watch 36s", "Watch 2m 30s", etc.
-const WATCH_RE = /^watch\s+\d/i;
+// Matches: "Watch 1m", "Watch 36s", "Watch 2m 30s", "Watch Video", etc.
+const WATCH_RE = /^watch(\s+\d|\s+video\b)/i;
+
+/** A stable-ish key for a quest card, so retries survive React re-renders. */
+function questKey(btn) {
+  let card = btn;
+  for (let i = 0; i < 6 && card.parentElement; i++) {
+    card = card.parentElement;
+    if (textOf(card).length > 40) break;
+  }
+  return textOf(card).slice(0, 120);
+}
 
 function collectWatchButtons() {
-  const out = [];
-  const nodes = document.querySelectorAll(
-    'button, [role="button"], [class*="button" i], [class*="btn" i]'
-  );
-  for (const el of nodes) {
-    if (!isVisible(el)) continue;
-    const t = (el.innerText || el.textContent || '').trim();
-    if (WATCH_RE.test(t)) {
-      out.push(el);
-      log('  Queued: ' + JSON.stringify(t));
+  return findButtons(WATCH_RE).filter(btn => {
+    if (topDialog() && topDialog().contains(btn)) return false;   // ignore modal contents
+    const tries = STATE.attempts.get(questKey(btn)) || 0;
+    return tries < CONFIG.MAX_ATTEMPTS_PER_QUEST;
+  });
+}
+
+/**
+ * Issue 2: video quests gated to the mobile client show their "watch the video"
+ * description but no Watch button in the browser. Log them so the user knows.
+ */
+function reportMobileOnlyQuests() {
+  const seen = new Set();
+  const walker = textWalker();
+  let n;
+  while ((n = walker.nextNode())) {
+    if (!/watch the video/i.test(n.textContent)) continue;
+    let card = n.parentElement;
+    // climb to the first ancestor that contains at least one button (the card)
+    for (let i = 0; i < 8 && card && !card.querySelector('button'); i++) card = card.parentElement;
+    if (!card || seen.has(card)) continue;
+    seen.add(card);
+    if (findButtons(WATCH_RE, card).length === 0 && !/claimed|completed/i.test(textOf(card))) {
+      const title = textOf(card).slice(0, 60);
+      report('Skipped (mobile-only?): ' + title, 'warn');
     }
   }
-  return out;
 }
 
 async function buildQueue() {
-  log('Scanning for video quests...');
-  const found = await waitFor(() => collectWatchButtons().length > 0, 10000);
-  if (!found) {
-    warn('No Watch-Xs buttons found - no video quests available or all already claimed');
-    return;
-  }
+  setPhase('scanning');
+  report('Scanning for video quests...');
+  await waitFor(() => collectWatchButtons().length > 0, 10000);
   STATE.questQueue = collectWatchButtons();
-  log(STATE.questQueue.length + ' video quest(s) queued');
+  reportMobileOnlyQuests();
+  report(STATE.questQueue.length + ' video quest(s) queued', STATE.questQueue.length ? 'good' : 'warn');
 }
 
 // ============================================================
@@ -229,96 +372,155 @@ async function openNextQuest() {
     STATE.questQueue = collectWatchButtons();
     btn = STATE.questQueue.shift();
   }
+  if (!btn) return false;
 
-  if (!btn) { warn('No Watch button available'); return false; }
+  const key = questKey(btn);
+  STATE.attempts.set(key, (STATE.attempts.get(key) || 0) + 1);
 
-  const label = (btn.innerText || btn.textContent || '').trim();
-  log('Clicking ' + JSON.stringify(label) + '...');
+  log('Clicking ' + JSON.stringify(textOf(btn)) + '...');
   reliableClick(btn);
 
-  // Wait for the video modal to appear
   const opened = await waitFor(() =>
     document.querySelector('video') ||
-    document.querySelector('[class*="videoModal" i]') ||
-    document.querySelector('[class*="questModal" i]') ||
-    findText('/ 0:'),    // timestamp like "0:01 / 0:37" appearing in modal
+    (topDialog() && findText('/ 0:', topDialog())) ||
+    topDialog(),
     8000
   );
+  if (!opened) { report('Video modal did not open', 'warn'); return false; }
 
-  if (!opened) { warn('Video modal did not open'); return false; }
-  log('Video modal open');
+  const dlg = topDialog();
+  const heading = dlg && dlg.querySelector('h1, h2, h3, [class*="title" i]');
+  STATE.currentQuest = heading ? textOf(heading).slice(0, 60) : textOf(btn);
+  report('Opened quest: ' + STATE.currentQuest);
   return true;
 }
 
 // ============================================================
-// Step 6 - Parse video duration and wait
+// Step 6 - Follow the real video until it has finished
 // ============================================================
 
-function parseDuration() {
-  // Discord shows "0:01 / 0:37" - capture the total-duration half after the slash
-  const m = document.body.innerText.match(/\/\s*(\d+):(\d{2})(?::(\d{2}))?/);
-  if (m) {
-    const hasHours = !!m[3];
-    const h  = hasHours ? parseInt(m[1], 10) : 0;
-    const mi = hasHours ? parseInt(m[2], 10) : parseInt(m[1], 10);
-    const s  = hasHours ? parseInt(m[3], 10) : parseInt(m[2], 10);
-    const ms = ((h * 3600) + (mi * 60) + s) * 1000;
-    log('Duration: ' + h + 'h ' + mi + 'm ' + s + 's (' + ms + 'ms)');
-    return ms;
-  }
-
-  // Fallback: read directly from the <video> element
-  const vid = document.querySelector('video');
-  if (vid && isFinite(vid.duration) && vid.duration > 0) {
-    const ms = Math.ceil(vid.duration * 1000);
-    log('Duration from <video> element: ' + ms + 'ms');
-    return ms;
-  }
-
-  warn('Duration unknown - using fallback ' + CONFIG.VIDEO_FALLBACK_MS + 'ms');
-  return CONFIG.VIDEO_FALLBACK_MS;
+/** Parses "0:01 / 0:37" (or "0:01 / 1:02:03") from the modal. Returns ms or null. */
+function parseTimestampMs() {
+  const root = topDialog() || document.body;
+  const m = (root.innerText || '').match(/\d+:\d{2}(?::\d{2})?\s*\/\s*(\d+):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const hasHours = m[3] !== undefined;
+  const h  = hasHours ? +m[1] : 0;
+  const mi = hasHours ? +m[2] : +m[1];
+  const s  = hasHours ? +m[3] : +m[2];
+  const ms = (h * 3600 + mi * 60 + s) * 1000;
+  return ms > 0 ? ms : null;
 }
 
-async function waitForVideo(durationMs) {
-  const total = durationMs + 2000;   // 2s buffer on top of actual duration
-  log('Waiting ' + (total / 1000).toFixed(1) + 's for video to finish...');
-  await sleep(total);
-  await sleep(CONFIG.POST_VIDEO_GRACE_MS);   // extra React re-render grace
-  log('Video wait complete');
+function findVideo() {
+  const dlg = topDialog();
+  const vids = [...(dlg || document).querySelectorAll('video')];
+  return vids.find(v => isFinite(v.duration) && v.duration > 0) || vids[0] || null;
+}
+
+/** Starts playback if the browser's autoplay policy blocked it (Safari does). */
+async function ensurePlaying(video) {
+  if (!video.paused || video.ended) return;
+  try {
+    await video.play();
+  } catch (_) {
+    // Autoplay with sound is blocked without a real user gesture - muted is allowed
+    video.muted = true;
+    try { await video.play(); log('Autoplay blocked - playing muted'); }
+    catch (e) { warn('Could not start video: ' + e.message); }
+  }
+}
+
+async function watchVideo() {
+  setPhase('watching');
+  STATE.videoProgress = 0;
+
+  // Retry for a few seconds - the player and its timestamp render after the modal
+  const found = await waitFor(() => {
+    const v = findVideo();
+    if (v && isFinite(v.duration) && v.duration > 0) return { video: v };
+    const ms = parseTimestampMs();
+    if (ms) return { ms };
+    return null;
+  }, CONFIG.VIDEO_DETECT_TIMEOUT_MS);
+
+  const video = (found && found.video) || findVideo();
+
+  if (video) {
+    await ensurePlaying(video);
+    const durMs = isFinite(video.duration) && video.duration > 0
+      ? video.duration * 1000
+      : (found && found.ms) || CONFIG.VIDEO_FALLBACK_MS;
+    report('Video started (' + Math.round(durMs / 1000) + 's)');
+
+    // Hard ceiling so a frozen player can't hang the loop forever
+    const deadline = Date.now() + durMs * 2 + 60000;
+    let hiddenWarned = false;
+    let lastTime = -1, stalledTicks = 0;
+
+    while (Date.now() < deadline) {
+      checkStop();
+      const v = video.isConnected ? video : findVideo();
+      if (!v) { warn('Video element disappeared'); break; }
+
+      const d = isFinite(v.duration) && v.duration > 0 ? v.duration : durMs / 1000;
+      STATE.videoProgress = Math.min(100, Math.round((v.currentTime / d) * 100));
+      push(null);
+
+      if (v.ended || v.currentTime >= d * CONFIG.VIDEO_DONE_RATIO) break;
+
+      if (document.hidden && !hiddenWarned) {
+        hiddenWarned = true;
+        report('Discord tab is in the background - keep it visible or the video pauses', 'warn');
+      }
+
+      // Restart playback if it paused or stalled (focus loss, buffering)
+      if (v.paused || v.currentTime === lastTime) stalledTicks++;
+      else stalledTicks = 0;
+      if (stalledTicks >= 4) { await ensurePlaying(v); stalledTicks = 0; }
+      lastTime = v.currentTime;
+
+      await sleep(1000);
+    }
+  } else {
+    const ms = (found && found.ms) || CONFIG.VIDEO_FALLBACK_MS;
+    if (!found) warn('No <video> or timestamp found - waiting fallback ' + Math.round(ms / 1000) + 's');
+    else report('Video started (' + Math.round(ms / 1000) + 's, timer only)');
+    const start = Date.now();
+    while (Date.now() - start < ms + 2000) {
+      STATE.videoProgress = Math.min(100, Math.round(((Date.now() - start) / ms) * 100));
+      push(null);
+      await sleep(1000);
+    }
+  }
+
+  STATE.videoProgress = 100;
+  report('Video complete');
+  await sleep(CONFIG.POST_VIDEO_GRACE_MS);
 }
 
 // ============================================================
-// Step 7 - hCaptcha handling
+// Step 7 - Captcha checkpoint: pause for the user
 // ============================================================
 
 function captchaUp() {
   return !!(
+    document.querySelector('iframe[src*="hcaptcha.com"], iframe[src*="captcha" i]') ||
     findText('Are you human') ||
-    findText('confirm you') ||
-    document.querySelector('iframe[src*="hcaptcha.com"]') ||
-    document.querySelector('[class*="captcha" i]')
+    findText('confirm you are human')
   );
 }
 
-// In-page banner shown when manual solve is needed
 let _banner = null;
 
 function showBanner(msg) {
   if (_banner) return;
   _banner = Object.assign(document.createElement('div'), { textContent: msg });
   Object.assign(_banner.style, {
-    position:    'fixed',
-    top:         '14px',
-    left:        '50%',
-    transform:   'translateX(-50%)',
-    zIndex:      '999999',
-    background:  '#ed4245',
-    color:       '#fff',
-    padding:     '11px 22px',
-    borderRadius:'8px',
-    font:        'bold 13px/1 sans-serif',
-    boxShadow:   '0 4px 14px rgba(0,0,0,.45)',
-    pointerEvents:'none',
+    position: 'fixed', top: '14px', left: '50%', transform: 'translateX(-50%)',
+    zIndex: '2147483647', background: '#ed4245', color: '#fff',
+    padding: '11px 22px', borderRadius: '8px', font: 'bold 13px/1 sans-serif',
+    boxShadow: '0 4px 14px rgba(0,0,0,.45)', pointerEvents: 'none',
   });
   document.body.appendChild(_banner);
 }
@@ -327,125 +529,139 @@ function hideBanner() {
   if (_banner) { _banner.remove(); _banner = null; }
 }
 
+/**
+ * The captcha is Discord's own anti-automation checkpoint; this extension does
+ * not try to click or solve it. It pauses and waits for the user to do it.
+ */
 async function handleCaptcha() {
   if (!captchaUp()) return;
-
-  STATE.phase = 'captcha';
-  log('hCaptcha detected - attempting auto-click...');
-  await sleep(1500);   // let iframe load its checkbox
-
-  const iframe = document.querySelector('iframe[src*="hcaptcha.com"]');
-  if (iframe) {
-    // hCaptcha renders its checkbox at the top-left of its cross-origin iframe.
-    // Content scripts cannot reach inside cross-origin iframes directly, but
-    // clicking the iframe element itself delivers the pointer event into it.
-    const r = iframe.getBoundingClientRect();
-    iframe.dispatchEvent(new MouseEvent('click', {
-      bubbles: true, cancelable: true, view: window,
-      clientX: r.left + 20,
-      clientY: r.top  + 20,
-    }));
-    log('Clicked hCaptcha iframe checkbox area');
-  } else {
-    // Discord sometimes renders the checkbox outside an iframe
-    const b = findButton(/i am human/i);
-    if (b) { reliableClick(b); log('Clicked I am human button'); }
-    else   { warn('No captcha element found - waiting for manual solve'); }
-  }
-
-  const cleared = await waitFor(() => !captchaUp(), CONFIG.CAPTCHA_AUTO_TIMEOUT_MS);
-
-  if (cleared) {
-    log('Captcha cleared automatically');
-  } else {
-    // Escalated to image challenge - pause and let the user solve it
-    showBanner('Orb Collector paused - please solve the captcha manually');
-    warn('Waiting for manual captcha solve (up to 5 min)...');
-    await waitFor(() => !captchaUp(), 5 * 60 * 1000);
+  const prev = STATE.phase;
+  setPhase('captcha');
+  showBanner('Orb Collector paused - please solve the captcha');
+  report('Captcha shown - solve it in the Discord tab to continue', 'warn');
+  try {
+    const cleared = await waitFor(() => !captchaUp(), CONFIG.CAPTCHA_MANUAL_TIMEOUT_MS);
+    if (!cleared) throw new Error('Captcha was not solved within 5 minutes');
+    report('Captcha solved - resuming', 'good');
+  } finally {
     hideBanner();
-    log('Manual captcha solved - resuming');
   }
+  STATE.phase = prev;
 }
 
 // ============================================================
 // Step 8 - Claim reward
 // ============================================================
 
+const CLAIM_RE = /^(claim(\s+reward)?|claim\s+\d[\d,]*\s+orbs?)$/i;
+
+function isLocked(el) {
+  return el.disabled ||
+         el.getAttribute('aria-disabled') === 'true' ||
+         !!el.querySelector('[class*="lock" i]');
+}
+
 async function claimReward() {
-  STATE.phase = 'claiming';
+  setPhase('claiming');
   log('Waiting for Claim Reward to unlock...');
 
-  // The button is visible but aria-disabled + has a lock icon child while the
-  // video is still playing. We poll until both conditions are gone.
-  const CLAIM_RE = /claim\s*reward|^claim$/i;
-
+  let sawLocked = false;
   const btn = await waitFor(() => {
-    const nodes = document.querySelectorAll(
-      'button, [role="button"], [class*="button" i]'
-    );
-    for (const el of nodes) {
-      if (!isVisible(el)) continue;
-      const t = (el.innerText || el.textContent || '').trim();
-      if (!CLAIM_RE.test(t)) continue;
-      if (el.disabled) continue;
-      if (el.getAttribute('aria-disabled') === 'true') continue;
-      if (el.querySelector('[class*="lock" i]')) continue;
+    // The captcha can show up late, right before the button unlocks
+    if (captchaUp()) return null;
+    for (const el of findButtons(CLAIM_RE)) {
+      if (isLocked(el)) { sawLocked = true; continue; }
       return el;
     }
     return null;
-  }, CONFIG.ELEMENT_TIMEOUT_MS);
+  }, CONFIG.CLAIM_TIMEOUT_MS);
 
-  if (!btn) { err('Claim Reward never unlocked - skipping quest'); return false; }
+  if (!btn) {
+    if (captchaUp()) { await handleCaptcha(); return claimReward(); }
+    report(sawLocked
+      ? 'Claim Reward stayed locked - Discord did not register the watch, skipping'
+      : 'Claim Reward button not found - skipping', 'error');
+    return false;
+  }
 
-  log('Clicking Claim Reward...', btn);
   reliableClick(btn);
-  log('Claimed!');
+  STATE.questsDone++;
+  report('Reward claimed! Total: ' + STATE.questsDone, 'good');
   return true;
 }
 
 // ============================================================
-// Step 9 - Dismiss reward modal
+// Step 9 - Dismiss reward modal, read Orb balance
 // ============================================================
 
+function parseNumber(s) {
+  const n = parseInt(String(s).replace(/[\s,.  ]/g, ''), 10);
+  return isFinite(n) ? n : null;
+}
+
+/** Issue 6: read "Your Orbs balance is now 400." from the reward modal. */
+function balanceFromModal() {
+  const el = findText('balance is now');
+  if (!el) return null;
+  const block = el.closest('p, div, span') || el;
+  const m = textOf(block).match(/balance is now\s*:?\s*([\d][\d,.\s  ]*)/i);
+  return m ? parseNumber(m[1]) : null;
+}
+
+/** Fallback: the numeric counter next to the orb icon in Discord's header. */
+function balanceFromHeader() {
+  for (const el of document.querySelectorAll('[class*="orb" i], [class*="currency" i], [class*="balance" i]')) {
+    if (!isVisible(el) || el.children.length > 3) continue;
+    const t = textOf(el);
+    if (/^\d[\d,.\s]*$/.test(t)) {
+      const n = parseNumber(t);
+      if (n !== null) return n;
+    }
+  }
+  return null;
+}
+
 async function dismissModal() {
-  STATE.phase = 'dismissing';
-  log('Waiting for reward modal...');
+  setPhase('dismissing');
 
   const modal = await waitFor(() =>
-    findText('Discord Orbs')   ||
-    findText('balance is now') ||
-    findText('Orbs balance')   ||
-    document.querySelector('[class*="rewardModal" i]'),
+    findText('balance is now') || findText('Orbs balance') || findText('Discord Orbs'),
     8000
   );
 
-  if (modal) {
-    // Log the new Orb balance for the user
-    const info = findText('balance is now');
-    if (info) {
-      const p = info.closest('p, div, span');
-      if (p) log('  ' + p.innerText.trim());
-    }
-    await sleep(1500);   // let the orb animation play
-  } else {
-    warn('Reward modal not detected - dismissing anyway');
+  const bal = balanceFromModal() ?? balanceFromHeader();
+  if (bal !== null) {
+    STATE.orbBalance = bal;
+    report('Orb balance: ' + bal, 'good');
   }
+  if (modal) await sleep(1500);   // let the orb animation play
+  else warn('Reward modal not detected - dismissing anyway');
 
-  // Prefer an explicit close button; fall back to Escape key
+  const dlg = topDialog();
   const close =
-    document.querySelector('[aria-label*="close" i]')   ||
-    document.querySelector('[aria-label*="dismiss" i]') ||
-    findButton(/^[x\u00d7\u2715]$/i);
+    (dlg && dlg.querySelector('[aria-label*="close" i], [aria-label*="dismiss" i]')) ||
+    findButton(/^([x×✕]|close|done|nice|got it|ok)$/i, dlg || document);
 
   if (close && isVisible(close)) {
     reliableClick(close);
-    log('Closed reward modal');
   } else {
-    document.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true,
-    }));
-    log('Sent Escape to dismiss modal');
+    const opts = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+    (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', opts));
+    document.dispatchEvent(new KeyboardEvent('keydown', opts));
   }
+  await sleep(800);
+  STATE.currentQuest = null;
+  STATE.videoProgress = 0;
+  push(null);
+}
+
+/** Closes the video modal when a quest is skipped so the next one can open. */
+async function closeAnyModal() {
+  const dlg = topDialog();
+  if (!dlg) return;
+  const close = dlg.querySelector('[aria-label*="close" i]');
+  if (close) reliableClick(close);
+  else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
   await sleep(800);
 }
 
@@ -454,247 +670,116 @@ async function dismissModal() {
 // ============================================================
 
 async function runLoop() {
-  while (STATE.questQueue.length > 0) {
-    STATE.phase = 'watching';
-    log('--- Quest start (' + STATE.questQueue.length + ' remaining) ---');
-
-    const opened = await openNextQuest();         // Step 5
-    if (!opened) { warn('Skipping quest'); continue; }
-
-    const dur = parseDuration();                  // Step 6
-    await waitForVideo(dur);
-
-    await handleCaptcha();                        // Step 7
-
-    const claimed = await claimReward();          // Step 8
-    if (claimed) await dismissModal();            // Step 9
-
-    // Rescan for any quest cards that lazy-loaded during this iteration
-    const fresh = collectWatchButtons().filter(b => !STATE.questQueue.includes(b));
-    if (fresh.length) {
-      log(fresh.length + ' new quest(s) discovered - appending to queue');
-      STATE.questQueue.push(...fresh);
+  while (true) {
+    checkStop();
+    if (STATE.questQueue.length === 0) {
+      // Rescan for cards that lazy-loaded during the previous iteration
+      STATE.questQueue = collectWatchButtons();
+      if (STATE.questQueue.length === 0) break;
+      report(STATE.questQueue.length + ' more quest(s) found');
     }
 
-    // Human-pace jitter before the next quest
-    if (STATE.questQueue.length > 0) {
-      const jitter = randInt(CONFIG.JITTER_MIN_MS, CONFIG.JITTER_MAX_MS);
-      log('Jitter ' + jitter + 'ms...');
-      await sleep(jitter);
+    log('--- Quest start (' + STATE.questQueue.length + ' in queue) ---');
+
+    if (!(await openNextQuest())) { STATE.skipped++; continue; }
+
+    await watchVideo();
+    await handleCaptcha();
+
+    if (await claimReward()) await dismissModal();
+    else { STATE.skipped++; await closeAnyModal(); }
+
+    const jitter = randInt(CONFIG.JITTER_MIN_MS, CONFIG.JITTER_MAX_MS);
+    log('Pause ' + jitter + 'ms...');
+    await sleep(jitter);
+  }
+}
+
+async function run() {
+  if (STATE.running) return;
+  STATE.running   = true;
+  STATE.stopped   = false;
+  STATE.questsDone = 0;
+  STATE.skipped   = 0;
+  STATE.attempts  = new Map();
+  STATE.questQueue = [];
+  STATE.phase     = 'scanning';   // so the popup shows "running" right away
+
+  try {
+    await waitForAppMount();
+    await scrollToGrid();
+    await buildQueue();
+    await runLoop();
+    STATE.phase = 'done';
+    report('All available video quests processed (' + STATE.questsDone + ' claimed, ' +
+           STATE.skipped + ' skipped)', 'good');
+  } catch (e) {
+    if (e instanceof StoppedError) {
+      STATE.phase = 'stopped';
+      report('Stopped by user', 'warn');
+    } else {
+      STATE.phase = 'error';
+      report('Error: ' + e.message, 'error');
+      err(e);
     }
-  }
-
-  STATE.phase = 'done';
-  log('=== All video quests complete! ===');
-}
-
-// ============================================================
-// Boot
-// ============================================================
-
-async function main() {
-  log('Discord Orb Collector starting...');
-
-  if (!ensureQuestHome()) return;        // Step 1 (redirects if needed)
-  await waitForAppMount();               // Step 2
-  await sleep(2000);                     // extra hydration time for quest cards
-  await scrollToGrid();                  // Step 3
-  await buildQueue();                    // Step 4
-
-  if (STATE.questQueue.length === 0) {
-    log('No quests to run - done');
-    return;
-  }
-
-  await runLoop();                       // Steps 5-10
-}
-
-main().catch(e => err('Fatal error:', e));
-
-// ============================================================
-// UI Bridge - extra STATE fields + popup message handler
-// ============================================================
-
-// Extend STATE with fields the popup needs
-STATE.questsDone   = 0;     // how many quests have been claimed this session
-STATE.orbBalance   = null;  // last known orb balance parsed from reward modal
-STATE.currentQuest = null;  // label of the quest currently being watched
-STATE.videoStart   = null;  // epoch ms when the current video wait began
-STATE.videoDurMs   = 0;     // duration of the current video in ms
-STATE.stopped      = false; // user pressed Stop
-
-/**
- * Pushes a snapshot of STATE to the popup (if it is open).
- * Safe to call at any time - fails silently if popup is closed.
- */
-function pushToPopup(logText, logLevel) {
-  const payload = {
-    type:  'orbCollectorEvent',
-    state: getStatusSnapshot(),
-  };
-  if (logText) payload.log = { text: logText, level: logLevel || 'info' };
-  try { chrome.runtime.sendMessage(payload); } catch (_) { /* popup closed */ }
-}
-
-/** Returns a plain-object snapshot of the current STATE for the popup. */
-function getStatusSnapshot() {
-  let videoProgress = 0;
-  if (STATE.phase === 'watching' && STATE.videoStart && STATE.videoDurMs > 0) {
-    const elapsed = Date.now() - STATE.videoStart;
-    videoProgress = Math.min(100, Math.round((elapsed / STATE.videoDurMs) * 100));
-  }
-  return {
-    phase:         STATE.phase,
-    questsDone:    STATE.questsDone,
-    questQueue:    STATE.questQueue.length,
-    orbBalance:    STATE.orbBalance,
-    currentQuest:  STATE.currentQuest,
-    videoProgress: videoProgress,
-  };
-}
-
-/**
- * Reads the current Orbs balance from the top-right counter in the Discord UI.
- * Discord renders it as text near the orb icon - e.g. "200" or "1,200".
- */
-function scrapeOrbBalance() {
-  // The balance counter sits near "[orb icon] NNN" in the top bar
-  const candidates = document.querySelectorAll('[class*="currency" i], [class*="balance" i], [class*="orb" i]');
-  for (const el of candidates) {
-    const t = (el.innerText || el.textContent || '').trim().replace(/,/g, '');
-    if (/^\d+$/.test(t) && parseInt(t, 10) > 0) {
-      return parseInt(t, 10);
-    }
-  }
-  // Fallback: look for "Your Orbs balance is now NNN" text
-  const info = findText('balance is now');
-  if (info) {
-    const m = (info.innerText || '').match(/(\d[\d,]*)\s*$/);
-    if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-  }
-  return null;
-}
-
-// Patch the existing functions to push state updates to the popup
-// We wrap them after definition so we don't break the original logic.
-
-const _origBuildQueue = buildQueue;
-buildQueue = async function() {
-  STATE.phase = 'scanning';
-  pushToPopup('Scanning for video quests…', 'info');
-  await _origBuildQueue();
-  pushToPopup(STATE.questQueue.length + ' quest(s) found', 'good');
-};
-
-const _origOpenNextQuest = openNextQuest;
-openNextQuest = async function() {
-  const result = await _origOpenNextQuest();
-  if (result) {
-    // try to grab the quest name from the modal title area
-    const titleEl = document.querySelector('[class*="questTitle" i], [class*="quest-title" i]') ||
-                    findText('Quest') || null;
-    STATE.currentQuest = titleEl
-      ? (titleEl.innerText || '').trim().split('\n')[0].slice(0, 40)
-      : null;
-    pushToPopup('Opened quest: ' + (STATE.currentQuest || '(unknown)'), 'info');
-  }
-  return result;
-};
-
-const _origWaitForVideo = waitForVideo;
-waitForVideo = async function(durationMs) {
-  STATE.videoStart  = Date.now();
-  STATE.videoDurMs  = durationMs;
-  pushToPopup('Video started (' + (durationMs / 1000).toFixed(0) + 's)', 'info');
-
-  // Tick the progress bar every 3s while waiting
-  const tickInterval = setInterval(() => {
-    if (STATE.phase === 'watching') pushToPopup(null);
-  }, 3000);
-
-  await _origWaitForVideo(durationMs);
-  clearInterval(tickInterval);
-  STATE.videoStart = null;
-  pushToPopup('Video complete', 'info');
-};
-
-const _origHandleCaptcha = handleCaptcha;
-handleCaptcha = async function() {
-  const before = STATE.phase;
-  await _origHandleCaptcha();
-  if (STATE.phase === 'captcha') {
-    pushToPopup('Captcha detected - waiting…', 'warn');
-  }
-};
-
-const _origClaimReward = claimReward;
-claimReward = async function() {
-  const result = await _origClaimReward();
-  if (result) {
-    STATE.questsDone++;
-    const bal = scrapeOrbBalance();
-    if (bal !== null) STATE.orbBalance = bal;
-    pushToPopup('Reward claimed! Total: ' + STATE.questsDone, 'good');
-  }
-  return result;
-};
-
-const _origDismissModal = dismissModal;
-dismissModal = async function() {
-  await _origDismissModal();
-  const bal = scrapeOrbBalance();
-  if (bal !== null) {
-    STATE.orbBalance = bal;
-    pushToPopup('Orb balance: ' + bal, 'good');
-  }
-  STATE.currentQuest = null;
-  pushToPopup(null);  // refresh stats
-};
-
-// ── Message listener (popup → content script) ────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.action === 'getStatus') {
-    sendResponse(getStatusSnapshot());
-    return true;
-  }
-
-  if (msg.action === 'start') {
-    if (['idle', 'done', 'stopped', 'boot'].includes(STATE.phase)) {
-      STATE.stopped    = false;
-      STATE.questsDone = 0;
-      STATE.phase      = 'scanning';
-      // Re-run from Step 3 onwards (we're already on quest-home if popup is open)
-      (async () => {
-        try {
-          await scrollToGrid();
-          await buildQueue();
-          if (STATE.questQueue.length > 0) {
-            await runLoop();
-          } else {
-            STATE.phase = 'idle';
-            pushToPopup('No quests found', 'warn');
-          }
-        } catch(e) {
-          STATE.phase = 'error';
-          pushToPopup('Error: ' + e.message, 'error');
-          err('Error in start handler:', e);
-        }
-      })();
-    }
-    sendResponse(getStatusSnapshot());
-    return true;
-  }
-
-  if (msg.action === 'stop') {
-    STATE.stopped = true;
-    STATE.phase   = 'stopped';
+  } finally {
+    STATE.running = false;
+    STATE.currentQuest = null;
+    STATE.videoProgress = 0;
     hideBanner();
-    pushToPopup('Stopped by user', 'warn');
-    sendResponse(getStatusSnapshot());
-    return true;
+    push(null);
   }
+}
+
+/** Start requested from the popup. Navigates first if needed. */
+async function start() {
+  if (STATE.running) return;
+  if (!isOnQuestHome()) {
+    STATE.phase = 'navigating';
+    push('Navigating to quest-home...', 'info');
+    await setPendingStart(true);
+    window.location.assign(CONFIG.QUEST_HOME_URL);
+    return;   // page reloads; boot() resumes the run
+  }
+  run();
+}
+
+function stop() {
+  if (!STATE.running && STATE.phase !== 'navigating') return;
+  STATE.stopped = true;
+  STATE.phase = 'stopped';
+  setPendingStart(false);
+  hideBanner();
+  push(null);
+}
+
+// ============================================================
+// Popup bridge
+// ============================================================
+
+api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || typeof msg.action !== 'string') return false;
+  switch (msg.action) {
+    case 'getStatus': break;
+    case 'start':     start(); break;
+    case 'stop':      stop();  break;
+    default:          return false;
+  }
+  sendResponse(snapshot());
+  return false;   // response sent synchronously
 });
 
-// Push an initial heartbeat so the popup gets state immediately on open
-pushToPopup('Content script ready', 'good');
+// ============================================================
+// Boot - only resumes a run the user explicitly started
+// ============================================================
+
+(async function boot() {
+  // Discord is a SPA: the content script only loads once, so a pending start
+  // is consumed on the first load of /quest-home after the redirect.
+  if (isOnQuestHome() && await consumePendingStart()) {
+    log('Resuming run started from the popup');
+    run();
+  } else {
+    push(null);
+  }
+})();

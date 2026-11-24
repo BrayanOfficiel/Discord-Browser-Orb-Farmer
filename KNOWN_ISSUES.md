@@ -1,172 +1,90 @@
-﻿# Known Issues
+# Known Issues
 
-This document tracks confirmed bugs, limitations, and edge cases in the current version.
-Each entry includes severity, reproduction steps, root cause analysis, and the best available workaround.
+Confirmed bugs, limitations and edge cases, with their status as of **1.2.0**.
 
 ---
 
 ## Issue 1 — Video does not play the full duration before claiming
 
-**Severity:** High  
-**Status:** Open
+**Status:** Fixed in 1.2.0
 
-### Symptom
-The extension clicks Claim Reward before the video has actually finished playing, resulting in the claim either failing silently or Discord not registering the full watch. The "Claim Reward" button may appear to be unlocked before the video server-side completion event fires.
+The extension used to sleep for a duration read once from the `0:01 / 0:37` text, so a video that buffered or paused (e.g. tab in the background) was claimed before Discord had registered the watch.
 
-### Root cause
-Discord tracks video watch progress server-side via events fired by the embedded video player. The extension waits based on the parsed timestamp duration (`0:01 / 0:37`) plus a 2-second buffer. However:
-- The timestamp is read **once** immediately after the modal opens, before the video may have fully buffered
-- If the video buffers or pauses mid-play (network hiccup, tab focus loss), the wall-clock wait completes but the actual watched percentage is lower
-- Discord's server may require a higher percentage threshold than just elapsed time
+**Fix:** `watchVideo()` now follows the real `<video>` element: it waits for `ended` or `currentTime >= duration × 0.98`, restarts playback if the video pauses or stalls, updates the popup with real progress, and warns when the tab is hidden. Wall-clock waiting is only used when no `<video>` can be found at all.
 
-### Workaround
-Increase `POST_VIDEO_GRACE_MS` and the buffer in `waitForVideo` in `content.js`:
-```js
-VIDEO_FALLBACK_MS:   5 * 60 * 1000,  // use 5 min fallback instead of 3
-POST_VIDEO_GRACE_MS: 8000,            // increase grace from 3s to 8s
-```
-Also make sure the Discord tab remains focused while the video plays — Discord pauses the video player when you switch away from the tab.
-
-### Fix direction
-- Poll `video.currentTime >= video.duration * 0.98` instead of wall-clock sleep
-- Subscribe to the `<video>` element's `ended` event and only proceed once it fires
-- Add a minimum wait of `video.duration * 1000 + 5000ms` regardless of the timestamp parse
+**Still true:** keep the Discord tab visible. Browsers throttle background tabs and Discord pauses the player there.
 
 ---
 
-## Issue 2 — Mobile-only quests are not detected or processed
+## Issue 2 — Mobile-only quests are not processed
 
-**Severity:** Medium  
-**Status:** By design / Won't fix in browser extension
+**Status:** By design (can't fix in a browser extension); now reported
 
-### Symptom
-Some quests (e.g. "Rewind Time with Zilean Quest — Watch the video to win 200 Orbs!") show a **"Watch Xm"** button on mobile Discord but show no Watch button on the desktop browser client. The extension skips these entirely because the button never appears in the DOM.
+Discord gates some video quests to the mobile client. The browser renders the card without a Watch button.
 
-### Root cause
-Discord gates certain video quests to the mobile client only. The desktop browser renders the same quest card without a Watch button — instead showing "Play Now" or nothing actionable. This is a Discord platform decision, not a DOM selector issue.
-
-The extension correctly ignores these cards (there is no Watch button to click), but has no way to surface them as "skipped — mobile only" to the user.
-
-### Workaround
-Complete mobile-only quests on the Discord mobile app manually. These are typically short (under 2 minutes) and common with sponsored quests like League of Legends trailers.
-
-### Fix direction
-- Detect quest cards that have a video reward but no Watch button in the browser DOM
-- Log these as "mobile-only — skipped" in the popup activity log so the user knows to complete them on mobile
-- Could check for the absence of a Watch button while a "Claim X Orbs" label is present
+**Change:** cards that say "watch the video" but have no Watch button (and aren't already claimed) are listed in the activity log as *"Skipped (mobile-only?)"*. This is a text heuristic and may miss some cards. Complete them in the mobile app.
 
 ---
 
-## Issue 3 — hCaptcha iframe click does not always register the checkbox
+## Issue 3 — hCaptcha checkpoint
 
-**Severity:** Medium  
-**Status:** Open
+**Status:** Changed in 1.2.0: the extension no longer clicks the captcha
 
-### Symptom
-After the video ends, the "Are you human?" hCaptcha modal appears. The extension dispatches a click to the top-left corner of the hCaptcha iframe (where the checkbox is rendered), but the captcha does not always clear. The red manual-solve banner appears.
+The old code dispatched a synthetic click at the hCaptcha iframe. That could not work (a script-generated event is not delivered into a cross-origin iframe, and hCaptcha ignores untrusted events), and the captcha is Discord's anti-automation checkpoint anyway.
 
-### Root cause
-hCaptcha renders inside a **cross-origin iframe** — content scripts cannot reach the iframe's internal DOM. The extension clicks the iframe *element itself*, which routes the pointer event into the iframe document. This works when:
-- hCaptcha's risk score is low (low-traffic sessions, fresh accounts)
-- The checkbox renders at a predictable position
-
-It fails when:
-- hCaptcha escalates to an image challenge (full CAPTCHA grid)
-- The iframe hasn't fully rendered its checkbox by the time the click fires
-- The iframe position shifts due to Discord's modal layout
-
-### Workaround
-Solve the captcha manually when the red banner appears. The extension resumes automatically after the modal closes. The 1.5-second pre-click delay helps, but is not always sufficient.
-
-### Fix direction
-- Increase the pre-click sleep from 1500ms to 3000ms
-- Retry the click up to 3 times with 2-second gaps before showing the manual banner
-- Consider using `postMessage` into the iframe (may be blocked by CSP)
+**Behaviour now:** when the captcha appears (after the video or while waiting for Claim), the run pauses, a red banner is shown in the page and the popup shows *"Solve the captcha in the Discord tab"*. Once you solve it the run continues. After 5 minutes without a solve the run stops with an error.
 
 ---
 
 ## Issue 4 — Video duration parse fails on some quest formats
 
-**Severity:** Low  
-**Status:** Open
+**Status:** Fixed in 1.2.0
 
-### Symptom
-`parseDuration()` returns the fallback value (`VIDEO_FALLBACK_MS = 3 minutes`) even when a video is playing. The console shows: `Duration unknown - using fallback`.
-
-### Root cause
-The function scans `document.body.innerText` for the pattern `/ M:SS` (e.g. `/ 0:37`). This can fail if:
-- Discord's video player renders the timestamp inside a Shadow DOM or canvas element (not accessible via `innerText`)
-- The timestamp uses a non-standard separator or format
-- The modal hasn't fully rendered the timestamp when `parseDuration()` is called
-
-The `<video>.duration` fallback also fails if the video element is inside a Shadow DOM or cross-origin frame.
-
-### Workaround
-The 3-minute fallback is generally safe — most video quests are under 2 minutes. If your quests are longer, increase `VIDEO_FALLBACK_MS` in `content.js`.
-
-### Fix direction
-- Add a retry loop: wait up to 5 seconds for the timestamp to appear before falling back
-- Use a MutationObserver specifically on the modal to detect when the timestamp node appears
-- Prefer `video.duration` over text parsing — query all iframes for an accessible `<video>` element
+The duration now comes from `video.duration` first. The text fallback is scoped to the open modal, requires the full `M:SS / M:SS` form (the old regex could match any `/ 1:23` on the page), and is retried for up to 8 s while the player renders.
 
 ---
 
-## Issue 5 — Claim Reward poll times out if Discord is slow to unlock it
+## Issue 5 — Claim Reward poll times out if Discord is slow
 
-**Severity:** Low  
-**Status:** Open
+**Status:** Mitigated in 1.2.0
 
-### Symptom
-After the video wait, the extension polls for an unlocked Claim Reward button for up to `ELEMENT_TIMEOUT_MS` (15 seconds). On slow connections or if Discord's server hasn't registered the watch completion, the poll times out and the quest is skipped with: `Claim Reward never unlocked - skipping quest`.
-
-### Root cause
-Discord unlocks the Claim Reward button via a server-side event after confirming the watch percentage. The timing depends on network latency and Discord's backend processing speed.
-
-### Workaround
-Increase `ELEMENT_TIMEOUT_MS` in `content.js`:
-```js
-ELEMENT_TIMEOUT_MS: 30000,  // increase from 15s to 30s
-```
-
-### Fix direction
-- Increase the default timeout to 30 seconds
-- Add a specific error message distinguishing "button not found" from "button found but still locked"
+The timeout is now `CLAIM_TIMEOUT_MS` (30 s), and the log distinguishes *"button not found"* from *"button stayed locked — Discord did not register the watch"*. A skipped quest's modal is closed, and a quest is retried at most `MAX_ATTEMPTS_PER_QUEST` times instead of being re-queued forever.
 
 ---
 
-## Issue 6 — Orb balance counter shows "—" in popup
+## Issue 6 — Orb balance shows "—" in the popup
 
-**Severity:** Low (cosmetic)  
-**Status:** Open
+**Status:** Fixed in 1.2.0
 
-### Symptom
-The **Orbs** stat in the popup always shows `—` instead of the current balance.
-
-### Root cause
-`scrapeOrbBalance()` queries Discord's DOM for elements with class names containing "currency", "balance", or "orb". Discord uses obfuscated/hashed class names that change with each deployment (e.g. `currency_abc123`). The substring match is fragile and frequently misses the actual counter element.
-
-### Workaround
-The balance is still logged to the DevTools console (`[Orb Collector] Orb balance: 400`) after each claim. Check the console for accurate values.
-
-### Fix direction
-- Parse the balance from the reward modal text ("Your Orbs balance is now 400") at claim time, which is more reliable than querying the top bar
-- The `findText('balance is now')` path in `scrapeOrbBalance()` should catch this — investigate why it falls through
+The balance is parsed from the reward modal text ("Your Orbs balance is now 1,400.") with a regex that tolerates thousands separators and trailing punctuation; the old one required the number to be the last character. The header counter is only a fallback.
 
 ---
 
-## Issue 7 — Extension runs on all discord.com pages, not just quest-home
+## Issue 7 — Extension ran (and redirected) on every discord.com page
 
-**Severity:** Low  
-**Status:** By design with self-redirect
+**Status:** Fixed in 1.2.0
 
-### Symptom
-The content script loads on every `discord.com/*` page (as declared in `manifest.json`). On non-quest pages it immediately redirects to `/quest-home` when Start is pressed, which may be unexpected.
+`main()` ran on every page load, so simply opening any Discord channel redirected to `/quest-home` and started the automation without pressing Start.
 
-### Root cause
-The `content_scripts` matcher is `https://discord.com/*` so the script initialises everywhere. The `ensureQuestHome()` function only redirects when `main()` runs (on page load or when Start is pressed from the popup).
+**Fix:** nothing runs until Start is pressed. If you press Start elsewhere on Discord, the extension stores a short-lived flag, navigates to `/quest-home`, and resumes there.
 
-### Workaround
-Only press Start when you're already on `discord.com`. The extension will not auto-redirect unless you click Start.
+---
 
-### Fix direction
-- Scope the content script to `https://discord.com/quest-home` only, and use `chrome.scripting.executeScript` to inject it into other tabs when needed
+## Other bugs fixed in 1.2.0
+
+- **Stop did nothing:** `STATE.stopped` was set but never read; the loop kept going. Every wait now checks it, so Stop takes effect within ~250 ms.
+- **Popup HTML injection:** log lines and the quest title (text taken from the Discord page) were inserted with `innerHTML` into the extension's popup. Everything now uses `textContent`.
+- **Duplicate queue entries:** a Watch `<button>` and its inner `[class*=button]` div were queued as two quests.
+- **Infinite loop on a quest that never unlocks:** the rescan re-added the same Watch button indefinitely.
+- **Two runs at once:** pressing Start while the page-load run was in progress started a second loop.
+- **Unhandled promise rejections** in the console every time the popup was closed.
+- **UTF-8 BOM** at the start of every file (including `manifest.json`), which some tools — Safari's converter included — reject.
+- **Unused `scripting` permission** removed.
+
+---
+
+## Safari-specific notes
+
+- The extension must be allowed on `discord.com` in Safari (click the extension icon on the page → *Always Allow on This Website*), otherwise the popup says *"Content script not responding"*.
+- Safari blocks autoplay with sound for script-initiated playback; the extension falls back to muted playback.
+- Ad-hoc signed builds need **Allow unsigned extensions**, which Safari resets on every restart.
